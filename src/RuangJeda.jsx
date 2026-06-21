@@ -427,7 +427,7 @@ function SoundscapePlayer() {
   );
   const [volume, setVolume] = useState(() => {
     const stored = Number(window.localStorage.getItem("ruangjeda-volume"));
-    return Number.isFinite(stored) && stored >= 0 ? stored : 0.35;
+    return Number.isFinite(stored) && stored >= 0 ? Math.min(stored, 1) : 0.55;
   });
   const audioRef = useRef(null);
 
@@ -439,7 +439,7 @@ function SoundscapePlayer() {
     window.localStorage.setItem("ruangjeda-volume", String(volume));
     if (audioRef.current?.master) {
       audioRef.current.master.gain.setTargetAtTime(
-        volume,
+        volumeToGain(volume),
         audioRef.current.context.currentTime,
         0.08,
       );
@@ -539,14 +539,14 @@ function SoundscapePlayer() {
             <input
               type="range"
               min="0"
-              max="0.7"
+              max="1"
               step="0.01"
               value={volume}
               onChange={(event) => setVolume(Number(event.target.value))}
               aria-label="Volume Jeda Suara"
             />
             <Volume2 size={16} />
-            <b>{Math.round((volume / 0.7) * 100)}%</b>
+            <b>{Math.round(volume * 100)}%</b>
           </div>
 
           <div className={`rj-sound-now ${playing ? "is-playing" : ""}`}>
@@ -604,120 +604,243 @@ function stopAmbientEngine(reference) {
   reference.current = null;
 }
 
+function volumeToGain(volume) {
+  if (volume <= 0) return 0;
+  return Math.pow(volume, 0.72) * 1.15;
+}
+
 function createAmbientEngine(kind, volume) {
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   if (!AudioContext) throw new Error("Browser tidak mendukung Web Audio.");
 
   const context = new AudioContext();
   const master = context.createGain();
-  const compressor = context.createDynamicsCompressor();
-  master.gain.value = volume;
-  compressor.threshold.value = -24;
-  compressor.knee.value = 18;
-  compressor.ratio.value = 4;
-  master.connect(compressor).connect(context.destination);
+  const warmth = context.createBiquadFilter();
+  const limiter = context.createDynamicsCompressor();
+  master.gain.value = volumeToGain(volume);
+  warmth.type = "lowpass";
+  warmth.frequency.value = 12500;
+  warmth.Q.value = 0.2;
+  limiter.threshold.value = -8;
+  limiter.knee.value = 8;
+  limiter.ratio.value = 14;
+  limiter.attack.value = 0.004;
+  limiter.release.value = 0.24;
+  master.connect(warmth).connect(limiter).connect(context.destination);
 
-  const nodes = [master, compressor];
+  const nodes = [master, warmth, limiter];
   const timers = [];
-  const randomBuffer = (seconds = 4) => {
+
+  const rememberTimer = (timer) => {
+    timers.push(timer);
+    return timer;
+  };
+
+  const randomBuffer = (type = "pink", seconds = 6) => {
     const buffer = context.createBuffer(2, context.sampleRate * seconds, context.sampleRate);
     for (let channel = 0; channel < 2; channel += 1) {
       const data = buffer.getChannelData(channel);
-      let last = 0;
+      let brown = 0;
+      let pinkA = 0;
+      let pinkB = 0;
+      let pinkC = 0;
       for (let index = 0; index < data.length; index += 1) {
         const white = Math.random() * 2 - 1;
-        last = last * 0.985 + white * 0.015;
-        data[index] = last * 3.2;
+        if (type === "white") {
+          data[index] = white * 0.55;
+        } else if (type === "brown") {
+          brown = (brown + 0.018 * white) / 1.018;
+          data[index] = brown * 3.3;
+        } else {
+          pinkA = 0.99765 * pinkA + white * 0.099046;
+          pinkB = 0.963 * pinkB + white * 0.2965164;
+          pinkC = 0.57 * pinkC + white * 1.0526913;
+          data[index] = (pinkA + pinkB + pinkC + white * 0.1848) * 0.11;
+        }
       }
     }
     return buffer;
   };
 
-  const addNoise = ({ low = 450, high = 5000, gain = 0.2, pulse = null }) => {
+  const addNoiseLayer = ({
+    type = "pink",
+    low = 40,
+    high = 12000,
+    gain = 0.2,
+    pan = 0,
+    lfoRate = 0,
+    lfoDepth = 0,
+  }) => {
     const source = context.createBufferSource();
     const lowpass = context.createBiquadFilter();
     const highpass = context.createBiquadFilter();
     const level = context.createGain();
-    source.buffer = randomBuffer();
+    const panner = context.createStereoPanner();
+    source.buffer = randomBuffer(type);
     source.loop = true;
     lowpass.type = "lowpass";
     lowpass.frequency.value = high;
+    lowpass.Q.value = 0.35;
     highpass.type = "highpass";
     highpass.frequency.value = low;
+    highpass.Q.value = 0.3;
     level.gain.value = gain;
-    source.connect(lowpass).connect(highpass).connect(level).connect(master);
+    panner.pan.value = pan;
+    source.connect(lowpass).connect(highpass).connect(level).connect(panner).connect(master);
     source.start();
-    nodes.push(source, lowpass, highpass, level);
-    if (pulse) {
-      const pulseTimer = window.setInterval(() => {
-        const now = context.currentTime;
-        level.gain.cancelScheduledValues(now);
-        level.gain.setValueAtTime(level.gain.value, now);
-        level.gain.linearRampToValueAtTime(pulse.max, now + pulse.rise);
-        level.gain.linearRampToValueAtTime(pulse.min, now + pulse.fall);
-      }, pulse.every);
-      timers.push(pulseTimer);
+    nodes.push(source, lowpass, highpass, level, panner);
+
+    if (lfoRate && lfoDepth) {
+      const lfo = context.createOscillator();
+      const depth = context.createGain();
+      lfo.type = "sine";
+      lfo.frequency.value = lfoRate;
+      depth.gain.value = lfoDepth;
+      lfo.connect(depth).connect(level.gain);
+      lfo.start();
+      nodes.push(lfo, depth);
     }
+
+    return { source, lowpass, highpass, level, panner };
   };
 
-  const addPad = (frequencies, gain = 0.035) => {
+  const addPad = (frequencies, gain = 0.12, cutoff = 900) => {
     frequencies.forEach((frequency, index) => {
       const oscillator = context.createOscillator();
       const filter = context.createBiquadFilter();
       const level = context.createGain();
+      const panner = context.createStereoPanner();
       oscillator.type = index % 2 ? "sine" : "triangle";
       oscillator.frequency.value = frequency;
-      oscillator.detune.value = (index - frequencies.length / 2) * 3;
+      oscillator.detune.value = (index - frequencies.length / 2) * 4;
       filter.type = "lowpass";
-      filter.frequency.value = 620;
+      filter.frequency.value = cutoff;
       level.gain.value = gain / frequencies.length;
-      oscillator.connect(filter).connect(level).connect(master);
+      panner.pan.value = frequencies.length === 1 ? 0 : -0.55 + (index / (frequencies.length - 1)) * 1.1;
+      oscillator.connect(filter).connect(level).connect(panner).connect(master);
       oscillator.start();
-      nodes.push(oscillator, filter, level);
+      nodes.push(oscillator, filter, level, panner);
     });
   };
 
-  const playBell = (frequency, delay = 0) => {
+  const playBell = (frequency, delay = 0, gain = 0.2, pan = 0) => {
     const now = context.currentTime + delay;
     const oscillator = context.createOscillator();
+    const overtone = context.createOscillator();
     const level = context.createGain();
+    const overtoneLevel = context.createGain();
+    const panner = context.createStereoPanner();
     oscillator.type = "sine";
+    overtone.type = "sine";
     oscillator.frequency.setValueAtTime(frequency, now);
     oscillator.frequency.exponentialRampToValueAtTime(frequency * 0.998, now + 4);
+    overtone.frequency.setValueAtTime(frequency * 2.01, now);
     level.gain.setValueAtTime(0.0001, now);
-    level.gain.exponentialRampToValueAtTime(0.16, now + 0.08);
+    level.gain.exponentialRampToValueAtTime(gain, now + 0.06);
     level.gain.exponentialRampToValueAtTime(0.0001, now + 5);
-    oscillator.connect(level).connect(master);
+    overtoneLevel.gain.setValueAtTime(0.0001, now);
+    overtoneLevel.gain.exponentialRampToValueAtTime(gain * 0.18, now + 0.04);
+    overtoneLevel.gain.exponentialRampToValueAtTime(0.0001, now + 2.8);
+    panner.pan.value = pan;
+    oscillator.connect(level).connect(panner);
+    overtone.connect(overtoneLevel).connect(panner);
+    panner.connect(master);
     oscillator.start(now);
+    overtone.start(now);
     oscillator.stop(now + 5.2);
+    overtone.stop(now + 3);
+  };
+
+  const playRainDrop = () => {
+    const now = context.currentTime;
+    const oscillator = context.createOscillator();
+    const level = context.createGain();
+    const panner = context.createStereoPanner();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(1600 + Math.random() * 2400, now);
+    oscillator.frequency.exponentialRampToValueAtTime(600 + Math.random() * 500, now + 0.09);
+    level.gain.setValueAtTime(0.0001, now);
+    level.gain.exponentialRampToValueAtTime(0.035 + Math.random() * 0.045, now + 0.008);
+    level.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+    panner.pan.value = Math.random() * 1.8 - 0.9;
+    oscillator.connect(level).connect(panner).connect(master);
+    oscillator.start(now);
+    oscillator.stop(now + 0.14);
+  };
+
+  const scheduleRainDrops = () => {
+    playRainDrop();
+    rememberTimer(window.setTimeout(scheduleRainDrops, 90 + Math.random() * 310));
+  };
+
+  const playCricket = () => {
+    const start = context.currentTime;
+    const oscillator = context.createOscillator();
+    const level = context.createGain();
+    const panner = context.createStereoPanner();
+    oscillator.type = "triangle";
+    oscillator.frequency.value = 3900 + Math.random() * 1200;
+    panner.pan.value = Math.random() * 1.7 - 0.85;
+    level.gain.setValueAtTime(0.0001, start);
+    for (let pulse = 0; pulse < 4; pulse += 1) {
+      const at = start + pulse * 0.11;
+      level.gain.exponentialRampToValueAtTime(0.025 + Math.random() * 0.018, at + 0.02);
+      level.gain.exponentialRampToValueAtTime(0.0001, at + 0.075);
+    }
+    oscillator.connect(level).connect(panner).connect(master);
+    oscillator.start(start);
+    oscillator.stop(start + 0.48);
+  };
+
+  const scheduleCrickets = () => {
+    playCricket();
+    rememberTimer(window.setTimeout(scheduleCrickets, 1500 + Math.random() * 3800));
   };
 
   if (kind === "soft-rain") {
-    addNoise({ low: 500, high: 6800, gain: 0.46 });
-    addNoise({ low: 1600, high: 9200, gain: 0.16 });
+    addNoiseLayer({ type: "pink", low: 420, high: 7600, gain: 0.5, pan: -0.18 });
+    addNoiseLayer({ type: "white", low: 2400, high: 11800, gain: 0.16, pan: 0.24 });
+    addNoiseLayer({ type: "brown", low: 45, high: 650, gain: 0.12, lfoRate: 0.07, lfoDepth: 0.035 });
+    scheduleRainDrops();
   } else if (kind === "slow-waves") {
-    addNoise({
+    addNoiseLayer({
+      type: "brown",
       low: 70,
-      high: 1100,
-      gain: 0.16,
-      pulse: { min: 0.09, max: 0.55, rise: 3.5, fall: 8, every: 11500 },
+      high: 820,
+      gain: 0.42,
+      pan: -0.12,
+      lfoRate: 0.075,
+      lfoDepth: 0.3,
     });
-    addPad([110, 164.81, 220], 0.09);
+    addNoiseLayer({
+      type: "white",
+      low: 850,
+      high: 5200,
+      gain: 0.17,
+      pan: 0.22,
+      lfoRate: 0.075,
+      lfoDepth: 0.13,
+    });
+    addNoiseLayer({ type: "pink", low: 120, high: 1800, gain: 0.18, pan: 0.35, lfoRate: 0.043, lfoDepth: 0.1 });
   } else if (kind === "night-air") {
-    addNoise({ low: 80, high: 1050, gain: 0.15 });
-    addPad([130.81, 196, 261.63], 0.14);
+    addNoiseLayer({ type: "brown", low: 55, high: 520, gain: 0.17, lfoRate: 0.035, lfoDepth: 0.055 });
+    addNoiseLayer({ type: "pink", low: 500, high: 2600, gain: 0.045, pan: -0.25 });
+    addPad([98, 146.83, 196], 0.055, 480);
+    scheduleCrickets();
   } else {
-    addPad([130.81, 164.81, 196, 261.63], 0.1);
-    [261.63, 329.63, 392, 329.63].forEach((note, index) => playBell(note, index * 2.5));
+    addNoiseLayer({ type: "brown", low: 35, high: 380, gain: 0.035 });
+    addPad([130.81, 164.81, 196, 261.63], 0.13, 760);
+    [261.63, 329.63, 392, 329.63].forEach((note, index) =>
+      playBell(note, index * 2.8, 0.18, index % 2 ? 0.3 : -0.3),
+    );
     let noteIndex = 0;
     const notes = [261.63, 329.63, 392, 440, 392, 329.63];
-    timers.push(window.setInterval(() => {
-      playBell(notes[noteIndex % notes.length]);
+    rememberTimer(window.setInterval(() => {
+      playBell(notes[noteIndex % notes.length], 0, 0.2, noteIndex % 2 ? 0.34 : -0.34);
       noteIndex += 1;
-    }, 7000));
+    }, 7600));
   }
 
-  context.resume?.();
   return { context, master, nodes, timers };
 }
 
